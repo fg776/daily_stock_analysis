@@ -10,6 +10,7 @@ Any expensive data preparation should be injected by the caller via extra_contex
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -132,7 +133,7 @@ def render(
     sell_count = sum(1 for r in results if getattr(r, "decision_type", "") == "sell")
     hold_count = sum(1 for r in results if getattr(r, "decision_type", "") in ("hold", ""))
 
-    report_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
     def failed_checks(checklist: List[str]) -> List[str]:
         return [c for c in (checklist or []) if c.startswith("❌") or c.startswith("⚠️")]
