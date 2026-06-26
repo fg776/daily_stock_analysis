@@ -165,6 +165,41 @@ def _normalize_report_date(value: Any) -> Optional[str]:
     return parsed.date().isoformat() if parsed else None
 
 
+def _get_recent_report_dates() -> List[str]:
+    """生成最近几个报告期的日期列表 (YYYYMMDD 格式)"""
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    
+    dates = []
+    # 最近4个季度报告期
+    quarters = [
+        (year, 3, 31),    # 一季报
+        (year, 6, 30),    # 中报
+        (year, 9, 30),    # 三季报
+        (year, 12, 31),   # 年报
+    ]
+    
+    # 按当前月份倒序排列报告期（从最新的开始）
+    current_quarter_idx = (month - 1) // 3
+    ordered_quarters = []
+    for i in range(current_quarter_idx, current_quarter_idx - 4, -1):
+        idx = i % 4
+        year_offset = 0 if i >= 0 else -1
+        y, m, d = quarters[idx]
+        ordered_quarters.append((y + year_offset, m, d))
+    
+    for y, m, d in ordered_quarters:
+        dates.append(f"{y}{m:02d}{d:02d}")
+    
+    # 也加上去年的
+    last_year = year - 1
+    for y, m, d in quarters:
+        dates.append(f"{last_year}{m:02d}{d:02d}")
+    
+    return dates
+
+
 def _build_dividend_payload(
     dividend_df: pd.DataFrame,
     stock_code: str,
@@ -289,6 +324,47 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
+    def _call_with_date_iteration_and_filter(
+        self,
+        func_name: str,
+        stock_code: str,
+        max_dates: int = 4,
+    ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
+        """
+        对返回全市场数据的接口，迭代最近几个报告期日期调用，然后按股票代码过滤。
+        """
+        errors: List[str] = []
+        try:
+            import akshare as ak
+        except Exception as exc:
+            return None, None, [f"import_akshare:{type(exc).__name__}"]
+
+        fn = getattr(ak, func_name, None)
+        if fn is None:
+            return None, None, [f"{func_name}:function_not_found"]
+
+        report_dates = _get_recent_report_dates()[:max_dates]
+        all_matched_rows: List[pd.Series] = []
+        
+        for report_date in report_dates:
+            try:
+                df = fn(date=report_date)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    matched = _filter_rows_by_code(df, stock_code)
+                    if not matched.empty:
+                        for _, row in matched.iterrows():
+                            all_matched_rows.append(row)
+                        errors.append(f"{func_name}:{report_date}:found_{len(matched)}")
+            except Exception as exc:
+                errors.append(f"{func_name}:{report_date}:{type(exc).__name__}")
+                continue
+        
+        if all_matched_rows:
+            result_df = pd.DataFrame(all_matched_rows)
+            return result_df, func_name, errors
+        
+        return None, None, errors
+
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
@@ -339,34 +415,87 @@ class AkshareFundamentalAdapter:
                     result["earnings"]["financial_report"] = financial_report_payload
                 result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast
-        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
-            ("stock_yjbb_em", {}),
-        ])
+        # Earnings forecast (业绩预告 - 全市场数据，需按日期迭代+股票过滤)
+        forecast_df, forecast_source, forecast_errors = self._call_with_date_iteration_and_filter(
+            "stock_yjyg_em", stock_code, max_dates=4
+        )
         result["errors"].extend(forecast_errors)
-        if forecast_df is not None:
-            row = _extract_latest_row(forecast_df, stock_code)
-            if row is not None:
+        if forecast_df is not None and not forecast_df.empty:
+            latest_row = forecast_df.iloc[0]
+            if latest_row is not None:
                 result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
-                )[:200]
+                    _pick_by_keywords(latest_row, ["预告", "业绩变动", "内容", "摘要", "公告", "业绩变动原因"])
+                )[:300]
+                forecast_type = _safe_str(_pick_by_keywords(latest_row, ["预告类型", "类型"]))
+                forecast_change = _safe_float(_pick_by_keywords(latest_row, ["业绩变动幅度", "变动幅度"]))
+                forecast_indicator = _safe_str(_pick_by_keywords(latest_row, ["预测指标", "指标"]))
+                report_date = _normalize_report_date(_pick_by_keywords(latest_row, ["公告日期", "报告期"]))
+                forecast_value = _safe_float(_pick_by_keywords(latest_row, ["预测数值", "数值"]))
+                if any(v is not None for v in [forecast_type, forecast_change, forecast_indicator, forecast_value]):
+                    result["earnings"]["forecast_detail"] = {
+                        "forecast_type": forecast_type,
+                        "forecast_change_pct": forecast_change,
+                        "forecast_indicator": forecast_indicator,
+                        "forecast_value": forecast_value,
+                        "announcement_date": report_date,
+                    }
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
-        # Earnings quick report
-        quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
-            ("stock_yjkb_em", {}),
-        ])
+        # Earnings report (业绩报表 - 全市场数据，需按日期迭代+股票过滤)
+        report_df, report_source, report_errors = self._call_with_date_iteration_and_filter(
+            "stock_yjbb_em", stock_code, max_dates=3
+        )
+        result["errors"].extend(report_errors)
+        if report_df is not None and not report_df.empty:
+            latest_row = report_df.iloc[0]
+            if latest_row is not None:
+                eps = _safe_float(_pick_by_keywords(latest_row, ["每股收益"]))
+                revenue = _safe_float(_pick_by_keywords(latest_row, ["营业总收入", "营业收入"]))
+                revenue_yoy = _safe_float(_pick_by_keywords(latest_row, ["营业总收入-同比增长", "营收同比", "同比增长"]))
+                net_profit = _safe_float(_pick_by_keywords(latest_row, ["净利润-净利润", "净利润"]))
+                net_profit_yoy = _safe_float(_pick_by_keywords(latest_row, ["净利润-同比增长", "净利润同比"]))
+                roe = _safe_float(_pick_by_keywords(latest_row, ["净资产收益率", "ROE"]))
+                gross_margin = _safe_float(_pick_by_keywords(latest_row, ["销售毛利率", "毛利率"]))
+                report_date = _normalize_report_date(_pick_by_keywords(latest_row, ["最新公告日期", "公告日期", "报告期"]))
+                if any(v is not None for v in [eps, revenue, net_profit, roe]):
+                    result["earnings"]["periodic_report"] = {
+                        "eps": eps,
+                        "revenue": revenue,
+                        "revenue_yoy": revenue_yoy,
+                        "net_profit": net_profit,
+                        "net_profit_yoy": net_profit_yoy,
+                        "roe": roe,
+                        "gross_margin": gross_margin,
+                        "report_date": report_date,
+                    }
+                result["source_chain"].append(f"earnings_report:{report_source}")
+
+        # Earnings quick report (业绩快报 - 全市场数据，需按日期迭代+股票过滤)
+        quick_df, quick_source, quick_errors = self._call_with_date_iteration_and_filter(
+            "stock_yjkb_em", stock_code, max_dates=3
+        )
         result["errors"].extend(quick_errors)
-        if quick_df is not None:
-            row = _extract_latest_row(quick_df, stock_code)
-            if row is not None:
+        if quick_df is not None and not quick_df.empty:
+            latest_row = quick_df.iloc[0]
+            if latest_row is not None:
                 result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
+                    _pick_by_keywords(latest_row, ["快报", "摘要", "公告", "说明"])
                 )[:200]
+                quick_revenue = _safe_float(_pick_by_keywords(latest_row, ["营业收入-营业收入", "营业收入"]))
+                quick_revenue_yoy = _safe_float(_pick_by_keywords(latest_row, ["营业收入-同比增长", "营收同比"]))
+                quick_profit = _safe_float(_pick_by_keywords(latest_row, ["净利润-净利润", "净利润"]))
+                quick_profit_yoy = _safe_float(_pick_by_keywords(latest_row, ["净利润-同比增长", "净利润同比"]))
+                quick_roe = _safe_float(_pick_by_keywords(latest_row, ["净资产收益率", "ROE"]))
+                quick_report_date = _normalize_report_date(_pick_by_keywords(latest_row, ["公告日期"]))
+                if any(v is not None for v in [quick_revenue, quick_profit, quick_roe]):
+                    result["earnings"]["quick_report_detail"] = {
+                        "revenue": quick_revenue,
+                        "revenue_yoy": quick_revenue_yoy,
+                        "net_profit": quick_profit,
+                        "net_profit_yoy": quick_profit_yoy,
+                        "roe": quick_roe,
+                        "report_date": quick_report_date,
+                    }
                 result["source_chain"].append(f"earnings_quick:{quick_source}")
 
         # Dividend details (cash dividend, pre-tax)
